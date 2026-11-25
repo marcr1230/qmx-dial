@@ -1,5 +1,6 @@
 // M5Dial -> QMX CAT controller, v3
-//   Screens: VFO / CW / AUDIO / SETUP
+//   Screens: VFO / PAN / CW / AUDIO / SETUP
+//   PAN: IQ spectrum +/-24 kHz (QMX IQ mode on while the screen is open)
 //   (swipe left/right, or long-press the knob)
 //   CW screen: speed, CW center (QMX moves offset + sidetone with it), filter width
 //              (filter choices = filters enabled in "Choose filters")
@@ -22,6 +23,8 @@
 #include "driver/gpio.h"
 #include "usb/usb_host.h"
 #include "usb/cdc_acm_host.h"
+#include "usb/uac_host.h"
+#include <math.h>
 
 // ---------------- settings ----------------
 #define QMX_CDC_IF  5               // fallback only; the CDC interface is auto-detected
@@ -264,6 +267,7 @@ static void usb_init()
 
     xTaskCreate(usb_connect_task, "usb_conn", 4096, nullptr, 5, nullptr);
 }
+static void pan_audio_init();
 
 // Never send CR/LF: a carriage return drops the QMX port into its menu
 static void cat_send(const char *cmd)
@@ -271,6 +275,196 @@ static void cat_send(const char *cmd)
     cdc_acm_dev_hdl_t h = qmx;
     if (!h || !connected || qmx_gone) return;
     cdc_acm_host_data_tx_blocking(h, (const uint8_t *)cmd, strlen(cmd), 200);
+}
+
+
+// ---------------- PAN: USB audio (IQ) + FFT ----------------
+// The QMX's sound card streams 48 kHz, 24-bit stereo. In IQ mode (Q91;) left/right are I/Q,
+// so an FFT of them is the spectrum +/-24 kHz around the receiver's LO.
+#define PAN_N        512                    // FFT size -> 93.75 Hz per bin
+#define PAN_AVG      6                      // FFTs averaged per display update (~15 fps)
+#define PAN_W        240                    // display columns
+#define PAN_SWAP_IQ  0                      // set 1 if the spectrum is mirrored
+#define PAN_LO_OFS   12000                  // Hz: dial freq minus IQ centre (QMX uses a ~12 kHz low IF)
+
+struct uac_evt_t { bool driver; int event; uint8_t addr, iface; uac_host_device_handle_t h; };
+static QueueHandle_t uac_q;
+static volatile bool pan_active = false;    // PAN screen showing -> run the FFT
+static volatile bool pan_audio_ok = false;  // audio stream running
+static volatile bool pan_ready = false;     // new pan_px[] available for the UI
+static float pan_px[PAN_W];                 // dB per display column (published)
+static volatile int  pan_rate = 48000;
+
+static float fft_re[PAN_N], fft_im[PAN_N], pan_win[PAN_N], pan_acc[PAN_N];
+static float tw_c[PAN_N / 2], tw_s[PAN_N / 2];
+static uint16_t bitrev[PAN_N];
+
+static void fft_init()
+{
+    int bits = 0;
+    while ((1 << bits) < PAN_N) bits++;
+    for (int i = 0; i < PAN_N; i++) {
+        int r = 0;
+        for (int b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);
+        bitrev[i] = r;
+        pan_win[i] = 0.5f - 0.5f * cosf(2 * (float)M_PI * i / (PAN_N - 1));   // Hann
+    }
+    for (int i = 0; i < PAN_N / 2; i++) {
+        tw_c[i] = cosf(2 * (float)M_PI * i / PAN_N);
+        tw_s[i] = -sinf(2 * (float)M_PI * i / PAN_N);
+    }
+}
+
+static void fft_run()                       // in place, radix-2
+{
+    for (int i = 0; i < PAN_N; i++) {
+        int j = bitrev[i];
+        if (j > i) {
+            float t = fft_re[i]; fft_re[i] = fft_re[j]; fft_re[j] = t;
+            t = fft_im[i]; fft_im[i] = fft_im[j]; fft_im[j] = t;
+        }
+    }
+    for (int len = 2; len <= PAN_N; len <<= 1) {
+        int half = len / 2, step = PAN_N / len;
+        for (int i = 0; i < PAN_N; i += len) {
+            for (int k = 0; k < half; k++) {
+                float wr = tw_c[k * step], wi = tw_s[k * step];
+                int a = i + k, b = a + half;
+                float xr = fft_re[b] * wr - fft_im[b] * wi;
+                float xi = fft_re[b] * wi + fft_im[b] * wr;
+                fft_re[b] = fft_re[a] - xr; fft_im[b] = fft_im[a] - xi;
+                fft_re[a] += xr;            fft_im[a] += xi;
+            }
+        }
+    }
+}
+
+static void uac_driver_cb(uint8_t addr, uint8_t iface, const uac_host_driver_event_t ev, void *)
+{
+    uac_evt_t e = {true, (int)ev, addr, iface, nullptr};
+    xQueueSend(uac_q, &e, 0);
+}
+static void uac_device_cb(uac_host_device_handle_t h, const uac_host_device_event_t ev, void *)
+{
+    uac_evt_t e = {false, (int)ev, 0, 0, h};
+    xQueueSend(uac_q, &e, 0);
+}
+
+static inline int32_t pcm24(const uint8_t *p)
+{
+    return (int32_t)((uint32_t)p[0] << 8 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 24);
+}
+
+static void uac_task(void *)
+{
+    uac_host_device_handle_t mic = nullptr;
+    static uint8_t buf[4096];
+    uint8_t carry[8];
+    int carry_n = 0, sub = 3, ch = 2, n = 0, nacc = 0;
+
+    while (true) {
+        uac_evt_t e;
+        if (xQueueReceive(uac_q, &e, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+
+        if (e.driver && e.event == UAC_HOST_DRIVER_EVENT_RX_CONNECTED && !mic) {
+            uac_host_device_config_t dc = {};
+            dc.addr = e.addr;
+            dc.iface_num = e.iface;
+            dc.buffer_size = 19200;
+            dc.buffer_threshold = 2880;            // ~10 ms
+            dc.callback = uac_device_cb;
+            if (uac_host_device_open(&dc, &mic) != ESP_OK) { mic = nullptr; continue; }
+            uac_host_dev_info_t info;
+            uac_host_get_device_info(mic, &info);
+            uac_host_dev_alt_param_t best = {};
+            bool found = false;
+            for (int alt = 1; alt <= info.iface_alt_num && !found; alt++) {
+                uac_host_dev_alt_param_t p;
+                if (uac_host_get_device_alt_param(mic, alt, &p) != ESP_OK) continue;
+                if (p.channels != 2 || p.subframe_size != 3) continue;
+                if (p.sample_freq_type > 0) {
+                    for (int k = 0; k < p.sample_freq_type && k < UAC_FREQ_NUM_MAX; k++)
+                        if (p.sample_freq[k] == 48000) found = true;
+                } else if (48000 >= p.sample_freq_lower && 48000 <= p.sample_freq_upper) {
+                    found = true;
+                }
+                if (found) best = p;
+            }
+            uac_host_stream_config_t sc = {};
+            sc.channels = 2;
+            sc.bit_resolution = best.bit_resolution;
+            sc.sample_freq = 48000;
+            if (!found || uac_host_device_start(mic, &sc) != ESP_OK) {
+                uac_host_device_close(mic);
+                mic = nullptr;
+                continue;
+            }
+            sub = 3; ch = 2; carry_n = 0; n = 0; nacc = 0;
+            pan_rate = 48000;
+            pan_audio_ok = true;
+        } else if (!e.driver && e.event == UAC_HOST_DRIVER_EVENT_DISCONNECTED) {
+            uac_host_device_close(e.h);
+            if (e.h == mic) { mic = nullptr; pan_audio_ok = false; }
+        } else if (!e.driver && e.event == UAC_HOST_DEVICE_EVENT_RX_DONE && mic && e.h == mic) {
+            int fb = sub * ch;
+            uint32_t got = 0;
+            while (uac_host_device_read(mic, buf + carry_n, sizeof(buf) - carry_n, &got, 0) == ESP_OK
+                   && got > 0) {
+                if (carry_n) memcpy(buf, carry, carry_n);
+                int total = carry_n + (int)got;
+                int nfr = total / fb;
+                if (pan_active) {
+                    for (int f = 0; f < nfr; f++) {
+                        const uint8_t *q = buf + f * fb;
+                        float i = pcm24(q) * (1.0f / 2147483648.0f);
+                        float v = pcm24(q + sub) * (1.0f / 2147483648.0f);
+#if PAN_SWAP_IQ
+                        float t = i; i = v; v = t;
+#endif
+                        fft_re[n] = i * pan_win[n];
+                        fft_im[n] = v * pan_win[n];
+                        if (++n < PAN_N) continue;
+                        n = 0;
+                        fft_run();
+                        for (int k = 0; k < PAN_N; k++)
+                            pan_acc[k] += fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k];
+                        if (++nacc < PAN_AVG) continue;
+                        nacc = 0;
+                        if (!pan_ready) {
+                            // fftshift + map 512 bins -> 240 columns (max of the bins per column)
+                            for (int x = 0; x < PAN_W; x++) {
+                                int b0 = x * PAN_N / PAN_W, b1 = (x + 1) * PAN_N / PAN_W;
+                                float m = 0;
+                                for (int b = b0; b < b1; b++) {
+                                    float pw = pan_acc[(b + PAN_N / 2) % PAN_N];
+                                    if (pw > m) m = pw;
+                                }
+                                pan_px[x] = 10 * log10f(m / PAN_AVG + 1e-20f);
+                            }
+                            pan_ready = true;
+                        }
+                        memset(pan_acc, 0, sizeof(pan_acc));
+                    }
+                }
+                carry_n = total - nfr * fb;
+                if (carry_n) memcpy(carry, buf + nfr * fb, carry_n);
+            }
+        }
+    }
+}
+
+static void pan_audio_init()
+{
+    fft_init();
+    uac_q = xQueueCreate(32, sizeof(uac_evt_t));
+    uac_host_driver_config_t ud = {};
+    ud.create_background_task = true;
+    ud.task_priority = 9;
+    ud.stack_size = 4096;
+    ud.core_id = 0;
+    ud.callback = uac_driver_cb;
+    ESP_ERROR_CHECK(uac_host_install(&ud));
+    xTaskCreatePinnedToCore(uac_task, "uac", 6144, nullptr, 8, nullptr, 1);
 }
 
 // ---------------- radio state ----------------
@@ -327,7 +521,7 @@ static void send_tx()
 }
 
 // ---------------- display helpers ----------------
-enum { SCR_VFO, SCR_CW, SCR_AUDIO, SCR_SETUP, NSCR };
+enum { SCR_VFO, SCR_PAN, SCR_CW, SCR_AUDIO, SCR_SETUP, NSCR };
 static int screen = SCR_VFO;
 static int radio_sel = 0;           // SETUP screen cursor
 
@@ -598,7 +792,7 @@ static uint32_t conn_t = 0;                 // when the radio connected (scan st
 static int  cw_poll_n = 0;                  // rotates center / keyer / filter reads
 
 // One MM request in flight at a time, so we know what each reply belongs to
-enum { MM_IDLE, MM_GET_KEYER, MM_GET_CTR, MM_GET_COMP, MM_GET_BW,
+enum { MM_IDLE, MM_GET_KEYER, MM_GET_CTR, MM_GET_COMP, MM_GET_STV, MM_GET_BW,
        MM_FILT_NAME, MM_FILT_EN, MM_CW_ITEM, MM_SET };
 static int mm_state = MM_IDLE;
 static uint32_t mm_t = 0;
@@ -750,6 +944,7 @@ static void cw_tap(int x, int y)
 // ---------------- AUDIO screen ----------------
 // Volume: AG (AF gain, 0.25 dB units, 0-799).  RF gain: RG (dB, applies to the current band).
 // Compression: QMX menu item SSB|Microphone|Compression (dB), via MM; SSB transmit only.
+// Sidetone volume: QMX menu item CW|Sidetone volume, via MM.
 #define AF_STEP     4               // 1 dB per click
 #define AF_MAX      799
 #define RF_MAX      99              // range not documented
@@ -763,12 +958,23 @@ static uint32_t comp_dirty_t = 0;
 static uint32_t au_poll_t = 0;
 static const char *path_comp = "SSB|Microphone|Compression";
 
+// Sidetone volume: QMX menu item CW|Sidetone volume (default 70; range not documented)
+#define STV_STEP    5
+#define STV_MAX     100
+static int  stv = -1;                                  // -1 = unknown
+static bool stv_na = false;
+static bool stv_dirty = false;
+static uint32_t stv_dirty_t = 0, stv_set_t = 0;
+static int  au_poll_n = 0;                             // alternates compression / sidetone reads
+static const char *path_stv = "CW|Sidetone volume";
+
 #define AU_BTN_W    44
-#define AU_BTN_H    32
-#define AU_BTN_DX   72
-#define AU_VOL_DY   (-44)
-#define AU_RF_DY    (-4)
-#define AU_COMP_DY  36
+#define AU_BTN_H    30
+#define AU_BTN_DX   68
+#define AU_VOL_DY   (-54)
+#define AU_RF_DY    (-18)
+#define AU_COMP_DY  18
+#define AU_STV_DY   54
 
 static void au_af()
 {
@@ -793,17 +999,27 @@ static void au_comp()
     text_at(s, 0, AU_COMP_DY, &fonts::FreeSansBold9pt7b,
             comp_dirty ? TFT_YELLOW : TFT_WHITE, 96);
 }
+static void au_stv()
+{
+    char s[24];
+    if (stv_na)       snprintf(s, sizeof(s), "Sidetone n/a");
+    else if (stv < 0) snprintf(s, sizeof(s), "Sidetone --");
+    else              snprintf(s, sizeof(s), "Sidetone %d", stv);
+    text_at(s, 0, AU_STV_DY, &fonts::FreeSansBold9pt7b,
+            stv_dirty ? TFT_YELLOW : TFT_WHITE, 104);
+}
 static void au_draw()
 {
-    line("AUDIO", -78, &fonts::FreeSans9pt7b, TFT_DARKGREY, 70);
-    const int rows[] = {AU_VOL_DY, AU_RF_DY, AU_COMP_DY};
-    for (int i = 0; i < 3; i++) {
+    line("AUDIO", -88, &fonts::FreeSans9pt7b, TFT_DARKGREY, 70);
+    const int rows[] = {AU_VOL_DY, AU_RF_DY, AU_COMP_DY, AU_STV_DY};
+    for (int i = 0; i < 4; i++) {
         draw_button(-AU_BTN_DX, rows[i], AU_BTN_W, AU_BTN_H, "-", TFT_WHITE);
         draw_button( AU_BTN_DX, rows[i], AU_BTN_W, AU_BTN_H, "+", TFT_WHITE);
     }
     au_af();
     au_rf();
     au_comp();
+    au_stv();
 }
 
 static void af_adj(int d)
@@ -841,6 +1057,18 @@ static void comp_adj(int d)
     comp_dirty_t = ms();
     au_comp();
 }
+// Menu item: written once you stop pressing (see cw_service)
+static void stv_adj(int d)
+{
+    if (stv < 0 || d == 0) return;
+    stv += d * STV_STEP;
+    if (stv < 0)       stv = 0;
+    if (stv > STV_MAX) stv = STV_MAX;
+    stv_dirty = true;
+    stv_dirty_t = ms();
+    au_stv();
+}
+
 static void au_tap(int x, int y)
 {
     if      (button_hit(x, y, -AU_BTN_DX, AU_VOL_DY,  AU_BTN_W, AU_BTN_H)) af_adj(-1);
@@ -849,6 +1077,8 @@ static void au_tap(int x, int y)
     else if (button_hit(x, y,  AU_BTN_DX, AU_RF_DY,   AU_BTN_W, AU_BTN_H)) rf_adj(+1);
     else if (button_hit(x, y, -AU_BTN_DX, AU_COMP_DY, AU_BTN_W, AU_BTN_H)) comp_adj(-1);
     else if (button_hit(x, y,  AU_BTN_DX, AU_COMP_DY, AU_BTN_W, AU_BTN_H)) comp_adj(+1);
+    else if (button_hit(x, y, -AU_BTN_DX, AU_STV_DY,  AU_BTN_W, AU_BTN_H)) stv_adj(-1);
+    else if (button_hit(x, y,  AU_BTN_DX, AU_STV_DY,  AU_BTN_W, AU_BTN_H)) stv_adj(+1);
 }
 
 // Filter scan: called when a level ends ("?;" reply or no answer)
@@ -917,6 +1147,18 @@ static void mm_reply(const char *r)
                 if (v != comp) {
                     comp = v;
                     if (screen == SCR_AUDIO) au_comp();
+                }
+            }
+            break;
+        case MM_GET_STV:
+            if (!ok) {
+                if (!stv_na) { stv_na = true; if (screen == SCR_AUDIO) au_stv(); }
+            } else if (!stv_dirty && ms() - stv_set_t > 1500) {
+                int v = atoi(r + 2);
+                stv_na = false;
+                if (v != stv) {
+                    stv = v;
+                    if (screen == SCR_AUDIO) au_stv();
                 }
             }
             break;
@@ -1048,13 +1290,29 @@ static void cw_service(uint32_t now)
         return;
     }
 
-    if (screen == SCR_AUDIO && now - au_poll_t > 1500) {
-        au_poll_t = now;
-        if (now - af_t > 800) cat_send("AG0;");
-        if (now - rf_t > 800) cat_send("RG;");
+    if (stv_dirty && now - stv_dirty_t > 800) {
         char cmd[96];
-        snprintf(cmd, sizeof(cmd), "MM%s;", path_comp);
-        mm_send(MM_GET_COMP, cmd);
+        snprintf(cmd, sizeof(cmd), "MM%s=%d;", path_stv, stv);
+        mm_send(MM_SET, cmd);
+        cat_send("MU;");
+        stv_dirty = false;
+        stv_set_t = now;
+        if (screen == SCR_AUDIO) au_stv();
+        return;
+    }
+
+    if (screen == SCR_AUDIO && now - au_poll_t > 750) {
+        au_poll_t = now;
+        char cmd[96];
+        if (au_poll_n++ % 2 == 0) {
+            if (now - af_t > 800) cat_send("AG0;");
+            if (now - rf_t > 800) cat_send("RG;");
+            snprintf(cmd, sizeof(cmd), "MM%s;", path_comp);
+            mm_send(MM_GET_COMP, cmd);
+        } else {
+            snprintf(cmd, sizeof(cmd), "MM%s;", path_stv);
+            mm_send(MM_GET_STV, cmd);
+        }
         return;
     }
 
@@ -1078,12 +1336,144 @@ static void cw_service(uint32_t now)
     }
 }
 
+// ---------------- PAN screen ----------------
+#define PAN_Y      74                       // spectrum area top (screen y)
+#define PAN_H      84                       // spectrum area height
+#define PAN_RANGE  50.0f                    // dB shown top to bottom
+static M5Canvas *pan_spr = nullptr;
+static float pan_floor = -120;              // auto-tracked noise floor (dB)
+
+static float pan_hz_per_px() { return (float)pan_rate / PAN_W; }
+static uint32_t step_freq(uint32_t f0, int delta);
+
+static void pan_header()
+{
+    char s[32], f[20];
+    fmt_freq(f, sizeof(f), freq);
+    text_at(f, 0, -78, &fonts::FreeSansBold12pt7b, TFT_GREEN, 200);
+    char st[16];
+    if (step >= 1000) snprintf(st, sizeof(st), "%lu kHz", (unsigned long)(step / 1000));
+    else              snprintf(st, sizeof(st), "%lu Hz", (unsigned long)step);
+    snprintf(s, sizeof(s), "%s   step %s", mode_name(mode), st);
+    text_at(s, 0, -56, &fonts::FreeSans9pt7b, TFT_CYAN, 160);
+}
+
+// Edge labels relative to the dial frequency, e.g. "-36k" ... "+12k"
+static void pan_scale()
+{
+    int lo_k = (int)lroundf((-pan_rate / 2 - PAN_LO_OFS) / 1000.0f);
+    int hi_k = (int)lroundf(( pan_rate / 2 - PAN_LO_OFS) / 1000.0f);
+    char s[12];
+    snprintf(s, sizeof(s), "%+dk", lo_k);
+    text_at(s, -78, 48, &fonts::FreeSans9pt7b, TFT_DARKGREY, 44);
+    snprintf(s, sizeof(s), "%+dk", hi_k);
+    text_at(s,  78, 48, &fonts::FreeSans9pt7b, TFT_DARKGREY, 44);
+    text_at(pan_audio_ok ? "" : "no audio", 0, 48, &fonts::FreeSans9pt7b, TFT_ORANGE, 90);
+}
+
+// Column of the dial frequency: right of the IQ centre by PAN_LO_OFS
+static int pan_marker_x() { return PAN_W / 2 + (int)lroundf(PAN_LO_OFS / pan_hz_per_px()); }
+
+static void pan_draw_spectrum()
+{
+    if (!pan_spr) return;
+    float px[PAN_W];
+    memcpy(px, pan_px, sizeof(px));
+    pan_ready = false;
+
+    // Noise floor: slowly track the 20th-percentile column level
+    float sorted[PAN_W];
+    memcpy(sorted, px, sizeof(sorted));
+    int k = PAN_W / 5;
+    for (int i = 0; i <= k; i++)                     // partial selection sort
+        for (int j = i + 1; j < PAN_W; j++)
+            if (sorted[j] < sorted[i]) { float t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t; }
+    float nf = sorted[k];
+    pan_floor = (pan_floor < -119) ? nf : pan_floor * 0.9f + nf * 0.1f;
+    float bottom = pan_floor - 5;
+
+    auto &c = *pan_spr;
+    c.fillSprite(TFT_BLACK);
+    for (int g = 1; g < 5; g++) c.drawFastHLine(0, g * PAN_H / 5, PAN_W, 0x2104);   // 10 dB grid
+    int mx = pan_marker_x();
+    c.drawFastVLine(mx, 0, PAN_H, 0x7800);                                           // tuned freq
+    int prev_y = -1;
+    for (int x = 0; x < PAN_W; x++) {
+        float v = (px[x] - bottom) / PAN_RANGE;
+        if (v < 0) v = 0;
+        if (v > 1) v = 1;
+        int y = PAN_H - 1 - (int)(v * (PAN_H - 1));
+        c.drawFastVLine(x, y, PAN_H - y, 0x0320);                                    // fill
+        if (prev_y >= 0) c.drawLine(x - 1, prev_y, x, y, TFT_GREEN);                 // trace
+        prev_y = y;
+    }
+    c.pushSprite(0, PAN_Y);
+}
+
+static void pan_draw()
+{
+    line("PAN", -98, &fonts::FreeSans9pt7b, TFT_DARKGREY, 60);
+    pan_header();
+    pan_scale();
+    pan_ready = false;
+}
+
+static void pan_enter()
+{
+    if (!pan_spr) {
+        pan_spr = new M5Canvas(&M5.Display);
+        if (!pan_spr->createSprite(PAN_W, PAN_H)) { delete pan_spr; pan_spr = nullptr; }
+    }
+    pan_floor = -120;
+    pan_active = true;
+    cat_send("Q91;");                         // IQ mode on (not saved by the QMX)
+}
+
+static void pan_leave()
+{
+    pan_active = false;
+    cat_send("Q90;");                         // back to normal audio
+    if (pan_spr) { pan_spr->deleteSprite(); delete pan_spr; pan_spr = nullptr; }
+}
+
+static void pan_tune(int d)
+{
+    if (freq == 0 || d == 0) return;
+    freq = step_freq(freq, d);
+    send_freq();
+    pan_header();
+}
+
+static void pan_next_step()
+{
+    int i = 0;
+    while (i < NSTEPS && steps[i] <= step) i++;
+    step = (i < NSTEPS) ? steps[i] : steps[0];
+    pan_header();
+}
+
+// Tap on the spectrum: tune there (rounded to the step)
+static void pan_tap(int x, int y)
+{
+    if (freq == 0 || y < PAN_Y || y >= PAN_Y + PAN_H) return;
+    int64_t f = (int64_t)freq + (int64_t)lroundf((x - pan_marker_x()) * pan_hz_per_px());
+    int64_t st = step;
+    f = ((f + st / 2) / st) * st;
+    if (f < 100000) return;
+    freq = (uint32_t)f;
+    send_freq();
+    pan_header();
+}
+
 static void draw_screen()
 {
     M5.Display.fillScreen(TFT_BLACK);
     switch (screen) {
         case SCR_VFO:
             vfo_status(); vfo_mode(); vfo_ab(); vfo_freq(); vfo_info(); vfo_rit();
+            break;
+        case SCR_PAN:
+            pan_draw();
             break;
         case SCR_CW:
             cw_draw();
@@ -1104,7 +1494,10 @@ static void draw_screen()
 
 static void goto_screen(int s)
 {
+    int prev = screen;
     screen = (s + NSCR) % NSCR;
+    if (prev == SCR_PAN && screen != SCR_PAN) pan_leave();
+    if (prev != SCR_PAN && screen == SCR_PAN) pan_enter();
     rit_edit = false;
     if (screen == SCR_SETUP) radio_sel = radio_idx;
     if (screen == SCR_CW) {
@@ -1394,6 +1787,7 @@ static void handle_reply(const char *r)
                 freq = f;
                 int b = band_of(freq);
                 if (b >= 0) band_last[b] = freq;
+                if (screen == SCR_PAN) pan_header();
                 if (screen == SCR_VFO) {
                     if (tx_target()) vfo_status(); else vfo_freq();   // RX is on the small line
                     if (b != old_band) vfo_info();
@@ -1401,6 +1795,7 @@ static void handle_reply(const char *r)
             }
             if (m != mode) {
                 mode = m;
+                if (screen == SCR_PAN) pan_header();
                 if (screen == SCR_VFO) vfo_mode();
             }
             if (v != vfo_rx || sp != split) {
@@ -1435,6 +1830,7 @@ extern "C" void app_main(void)
     rxq = xQueueCreate(8, sizeof(reply_t));
     encoder_init();
     usb_init();
+    pan_audio_init();
 
     int last_det = detents();
     uint32_t last_poll = 0;
@@ -1451,7 +1847,10 @@ extern "C" void app_main(void)
         if (connected != shown_conn || seen_vid != shown_vid) {
             shown_conn = connected;
             shown_vid = seen_vid;
-            if (connected) { cat_send("IF;"); cat_send("KS;"); conn_t = now; }
+            if (connected) {
+                cat_send("IF;"); cat_send("KS;"); conn_t = now;
+                if (screen == SCR_PAN) cat_send("Q91;");
+            }
             if (screen == SCR_VFO)   vfo_status();
             if (screen == SCR_SETUP) setup_conn();
         }
@@ -1501,6 +1900,16 @@ extern "C" void app_main(void)
                     else if (mode_tap(t.x, t.y))  cycle_mode();
                     else if (vfo_tap(t.x, t.y))   cycle_vfo();
                     else                          freq_tap(t.x, t.y);   // digit = step; elsewhere ignored
+                }
+                break;
+            case SCR_PAN:
+                if (d)     pan_tune(d);                // knob = tune
+                if (click) pan_next_step();            // knob press = step
+                if (tap)   pan_tap(t.x, t.y);          // tap spectrum = tune there
+                if (pan_ready) pan_draw_spectrum();
+                {
+                    static bool shown_audio = false;
+                    if (pan_audio_ok != shown_audio) { shown_audio = pan_audio_ok; pan_scale(); }
                 }
                 break;
             case SCR_CW:
