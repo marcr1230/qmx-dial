@@ -1,0 +1,54 @@
+dependencies:
+  espressif/usb_host_cdc_acm:
+    component_hash: 5bc1372b46de79ccae1dd17de48e30dfa1e8ab75269c2ebf54da01370f9e42fb
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    - name: espressif/usb
+      registry_url: https://components.espressif.com
+      require: public
+      rules:
+      - if: idf_version >=6.0
+      - if: target not in ["linux"]
+      version: ^1.0.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - esp32s31
+    - linux
+    version: 2.4.1
+  idf:
+    source:
+      type: idf
+    version: 5.5.6
+  m5stack/m5gfx:
+    component_hash: 7fc88fe4b0f25e76678a4f1731231f6361422ad763f2549d53840c76fd9ee769
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.3.0
+  m5stack/m5unified:
+    component_hash: fdbb605eb97359971ce1454fd27491d736a427542bcc852108d627f9f558c77a
+    dependencies:
+    - name: m5stack/m5gfx
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.3.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.3.0
+direct_dependencies:
+- espressif/usb_host_cdc_acm
+- idf
+- m5stack/m5unified
+manifest_hash: b3e111c9f1a3220807f6a19e23bbd3f0e241b0f5c668e4e4b936c3da884f3940
+target: esp32s3
+version: 2.0.0
